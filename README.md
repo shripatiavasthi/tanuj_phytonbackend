@@ -42,3 +42,4 @@ Service requests start as `pending_approval`; providers see requests after an ad
 Import this folder as the Vercel project root and add `MONGODB_URI`, `MONGODB_DATABASE`, and `JWT_SECRET` in the Vercel project's Environment Variables for the environments you use. Set `JWT_SECRET` to a random value of at least 32 characters. Add `S3_BUCKET`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` if prescription uploads are needed. Do not commit credentials. Vercel detects the FastAPI `app` instance and dependencies from `requirements.txt`.
 
 The mobile app API base URL should point to the deployed domain with the `/api` suffix.
+# tanuj_phytonbackend
