@@ -83,6 +83,64 @@ def test_services_and_consumer_request_lifecycle(api) -> None:
     assert database.requests.count_documents({"consumer_id": ObjectId(consumer_id)}) == 1
 
 
+def test_service_creation_requires_admin_jwt_and_stores_subservices_and_image(api, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, database, _ = api
+    monkeypatch.setenv("CRM_ADMIN_SETUP_SECRET", "test-setup-secret-at-least-32-characters")
+    admin_setup = client.post(
+        "/api/admin/setup",
+        headers={"X-Admin-Setup-Secret": "test-setup-secret-at-least-32-characters"},
+        json={
+            "name": "CRM Owner",
+            "email": "owner@example.com",
+            "password": "secure-admin-password",
+        },
+    )
+    admin_headers = {"Authorization": f"Bearer {admin_setup.json()['token']}"}
+    payload = {
+        "name": "Physiotherapy",
+        "description": "At-home movement support",
+        "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jN2kAAAAASUVORK5CYII=",
+        "sub_services": [
+            {
+                "name": "Shoulder Pain",
+                "description": "Mobility and pain support",
+                "icon": "💪",
+                "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jN2kAAAAASUVORK5CYII=",
+            },
+        ],
+    }
+
+    unauthorized = client.post("/api/services", json=payload)
+    created = client.post("/api/services", headers=admin_headers, json=payload)
+
+    assert unauthorized.status_code == 401
+    assert created.status_code == 201
+    assert created.json()["name"] == "Physiotherapy"
+    assert created.json()["image_url"] == payload["image_url"]
+    assert created.json()["sub_services"] == payload["sub_services"]
+    stored = database.services.find_one({"_id": ObjectId(created.json()["id"])})
+    assert stored["image_url"] == payload["image_url"]
+    services = client.get("/api/services").json()
+    created_service = next(item for item in services if item["id"] == created.json()["id"])
+    assert created_service["sub_services"] == payload["sub_services"]
+    assert created_service["image_url"] == payload["image_url"]
+    invalid_image = client.post(
+        "/api/services",
+        headers=admin_headers,
+        json={**payload, "image_url": "data:image/png;base64,aGVsbG8="},
+    )
+    assert invalid_image.status_code == 422
+    invalid_subservice_image = client.post(
+        "/api/services",
+        headers=admin_headers,
+        json={
+            **payload,
+            "sub_services": [{**payload["sub_services"][0], "image_url": "data:image/png;base64,aGVsbG8="}],
+        },
+    )
+    assert invalid_subservice_image.status_code == 422
+
+
 def test_provider_quote_booking_profile_stats_and_notifications(api) -> None:
     client, database, service_id = api
     consumer_token, consumer_id = register(api, "consumer", "consumer@example.com")

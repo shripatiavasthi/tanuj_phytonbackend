@@ -1,3 +1,6 @@
+import base64
+import binascii
+import hmac
 import logging
 import os
 import uuid
@@ -11,7 +14,7 @@ import boto3
 import jwt
 import certifi
 from bson import ObjectId
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -55,6 +58,73 @@ class FcmTokenRequest(BaseModel):
 
 class ProviderProfileUpdate(BaseModel):
     available: bool
+
+
+def validate_catalog_image(value: str | None) -> str | None:
+    if value is None:
+        return None
+    prefix, separator, encoded = value.partition(",")
+    supported_types = {
+        "data:image/jpeg;base64",
+        "data:image/png;base64",
+        "data:image/webp;base64",
+    }
+    if not separator or prefix.lower() not in supported_types:
+        raise ValueError("Image must be a base64 JPEG, PNG, or WebP data URL")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("Image must contain valid base64 data") from error
+    if not decoded or len(decoded) > 5 * 1024 * 1024:
+        raise ValueError("Image must be between 1 byte and 5 MB")
+    image_signatures = {
+        "data:image/jpeg;base64": decoded.startswith(b"\xff\xd8\xff"),
+        "data:image/png;base64": decoded.startswith(b"\x89PNG\r\n\x1a\n"),
+        "data:image/webp;base64": decoded.startswith(b"RIFF") and decoded[8:12] == b"WEBP",
+    }
+    if not image_signatures[prefix.lower()]:
+        raise ValueError("Image data does not match its declared format")
+    return value
+
+
+class ServiceSubService(BaseModel):
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    description: Annotated[str, Field(max_length=1000)] = ""
+    icon: Annotated[str, Field(max_length=16)] = ""
+    image_url: Annotated[str | None, Field(max_length=7_000_000)] = None
+
+    @field_validator("name")
+    @classmethod
+    def trim_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Subservice name must not be blank")
+        return normalized
+
+    @field_validator("image_url")
+    @classmethod
+    def validate_image(cls, value: str | None) -> str | None:
+        return validate_catalog_image(value)
+
+
+class ServiceCreateRequest(BaseModel):
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    description: Annotated[str, Field(max_length=2000)] = ""
+    image_url: Annotated[str | None, Field(max_length=7_000_000)] = None
+    sub_services: Annotated[list[ServiceSubService], Field(max_length=100)] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def trim_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Service name must not be blank")
+        return normalized
+
+    @field_validator("image_url")
+    @classmethod
+    def validate_base64_image(cls, value: str | None) -> str | None:
+        return validate_catalog_image(value)
 
 
 class UserRole(StrEnum):
@@ -101,6 +171,35 @@ class LoginRequest(BaseModel):
         return str(value).strip().lower()
 
 
+class AdminSetupRequest(BaseModel):
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    email: EmailStr
+    password: Annotated[str, Field(min_length=12, max_length=128)]
+
+    @field_validator("name")
+    @classmethod
+    def trim_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Name must not be blank")
+        return normalized
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).strip().lower()
+
+
+class AdminLoginRequest(BaseModel):
+    email: EmailStr
+    password: Annotated[str, Field(min_length=1, max_length=128)]
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).strip().lower()
+
+
 class PublicUser(BaseModel):
     id: str
     name: str
@@ -112,6 +211,11 @@ class PublicUser(BaseModel):
 class AuthResponse(BaseModel):
     token: str
     user: PublicUser
+
+
+class AdminAuthResponse(BaseModel):
+    token: str
+    admin: dict[str, str]
 
 
 app = FastAPI(title="CareConnect API", version="1.0.0")
@@ -157,6 +261,19 @@ def users_collection() -> Collection:
     database_name = os.getenv("MONGODB_DATABASE", "careconnect")
     configured_users_collection(uri, database_name)
     return database(uri, database_name)["users"]
+
+
+def admins_collection() -> Collection:
+    admins = collection("admins")
+    try:
+        admins.create_index("email", unique=True)
+    except PyMongoError as error:
+        logger.exception("Could not initialize the admins collection")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin authentication database is unavailable",
+        ) from error
+    return admins
 
 
 def collection(name: str) -> Collection:
@@ -207,6 +324,17 @@ def issue_token(user: PublicUser) -> str:
     return jwt.encode(claims, jwt_secret(), algorithm="HS256")
 
 
+def issue_admin_token(admin_id: str) -> str:
+    now = datetime.now(timezone.utc)
+    claims = {
+        "sub": admin_id,
+        "role": "admin",
+        "iat": now,
+        "exp": now + timedelta(hours=12),
+    }
+    return jwt.encode(claims, jwt_secret(), algorithm="HS256")
+
+
 def require_auth(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
 ) -> dict[str, Any]:
@@ -215,12 +343,18 @@ def require_auth(
     try:
         claims = jwt.decode(credentials.credentials, jwt_secret(), algorithms=["HS256"])
         subject = claims.get("sub")
-        role = UserRole(claims.get("role"))
+        role = claims.get("role")
     except (jwt.InvalidTokenError, ValueError, TypeError) as error:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token") from error
-    if not subject:
+    if not subject or role not in {UserRole.consumer.value, UserRole.provider.value, "admin"}:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
-    return {"id": subject, "role": role.value}
+    return {"id": subject, "role": role}
+
+
+def require_admin(user: Annotated[dict[str, Any], Depends(require_auth)]) -> dict[str, Any]:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return user
 
 
 def require_role(role: UserRole):
@@ -338,7 +472,12 @@ def health() -> dict[str, bool]:
 @app.post("/api/auth/register", response_model=AuthResponse)
 def register(payload: RegisterRequest) -> AuthResponse:
     jwt_secret()
-    collection = users_collection()
+    user = insert_user(payload)
+    return AuthResponse(token=issue_token(user), user=user)
+
+
+def insert_user(payload: RegisterRequest) -> PublicUser:
+    user_documents = users_collection()
     document = {
         "name": payload.name,
         "email": payload.email,
@@ -349,7 +488,7 @@ def register(payload: RegisterRequest) -> AuthResponse:
     }
 
     try:
-        result = collection.insert_one(document)
+        result = user_documents.insert_one(document)
     except DuplicateKeyError as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -363,8 +502,76 @@ def register(payload: RegisterRequest) -> AuthResponse:
         ) from error
 
     document["_id"] = result.inserted_id
-    user = public_user(document)
-    return AuthResponse(token=issue_token(user), user=user)
+    return public_user(document)
+
+
+@app.post("/api/admin/setup", response_model=AdminAuthResponse, status_code=status.HTTP_201_CREATED)
+def setup_admin(
+    payload: AdminSetupRequest,
+    setup_secret: Annotated[str | None, Header(alias="X-Admin-Setup-Secret")] = None,
+) -> AdminAuthResponse:
+    jwt_secret()
+    configured_secret = os.getenv("CRM_ADMIN_SETUP_SECRET")
+    if not configured_secret or len(configured_secret) < 32 or configured_secret.startswith("REPLACE_WITH_"):
+        raise HTTPException(status_code=503, detail="Admin setup is not configured")
+    if not setup_secret or not hmac.compare_digest(setup_secret, configured_secret):
+        raise HTTPException(status_code=401, detail="Invalid or missing admin setup secret")
+
+    admins = admins_collection()
+    try:
+        if admins.find_one({"_id": "primary"}) is not None:
+            raise HTTPException(status_code=409, detail="The CRM admin account has already been created")
+        document = {
+            "_id": "primary",
+            "name": payload.name,
+            "email": payload.email,
+            "password_hash": password_hash.hash(payload.password),
+            "created_at": datetime.now(timezone.utc),
+        }
+        admins.insert_one(document)
+    except DuplicateKeyError as error:
+        raise HTTPException(status_code=409, detail="The CRM admin account has already been created") from error
+    except PyMongoError as error:
+        logger.exception("Could not create CRM admin account")
+        raise HTTPException(
+            status_code=503,
+            detail="Admin authentication database is unavailable",
+        ) from error
+
+    return AdminAuthResponse(
+        token=issue_admin_token("primary"),
+        admin={"id": "primary", "name": document["name"], "email": document["email"]},
+    )
+
+
+@app.post("/api/admin/login", response_model=AdminAuthResponse)
+def login_admin(payload: AdminLoginRequest) -> AdminAuthResponse:
+    jwt_secret()
+    try:
+        document = admins_collection().find_one({"email": payload.email})
+    except PyMongoError as error:
+        logger.exception("Could not look up CRM admin for login")
+        raise HTTPException(
+            status_code=503,
+            detail="Admin authentication database is unavailable",
+        ) from error
+
+    if not document or not password_hash.verify(payload.password, document["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    return AdminAuthResponse(
+        token=issue_admin_token(str(document["_id"])),
+        admin={"id": str(document["_id"]), "name": document["name"], "email": document["email"]},
+    )
+
+
+@app.post("/api/admin/users")
+def create_user_as_admin(
+    payload: RegisterRequest,
+    _: Annotated[dict[str, Any], Depends(require_admin)],
+) -> dict[str, Any]:
+    user = insert_user(payload)
+    return {"user": user.model_dump()}
 
 
 @app.post("/api/auth/login", response_model=AuthResponse)
@@ -408,18 +615,47 @@ def save_fcm_token(payload: FcmTokenRequest, user: Annotated[dict[str, Any], Dep
 def get_services() -> list[dict[str, Any]]:
     try:
         services = collection("services").find({"active": {"$ne": False}}).sort("name", 1)
-        return [
-            {
+        result = []
+        for item in services:
+            service = {
                 "id": str(item["_id"]),
                 "name": item["name"],
                 "description": item.get("description", ""),
                 "image_url": item.get("image_url"),
             }
-            for item in services
-        ]
+            if "sub_services" in item:
+                service["sub_services"] = item["sub_services"]
+            result.append(service)
+        return result
     except PyMongoError as error:
         logger.exception("Could not list services")
         raise HTTPException(status_code=503, detail="Service catalog is unavailable") from error
+
+
+@app.post("/api/services", status_code=status.HTTP_201_CREATED)
+def create_service(
+    payload: ServiceCreateRequest,
+    _: Annotated[dict[str, Any], Depends(require_admin)],
+) -> dict[str, Any]:
+    document = {
+        "name": payload.name,
+        "description": payload.description.strip(),
+        "image_url": payload.image_url,
+        "sub_services": [item.model_dump() for item in payload.sub_services],
+        "active": True,
+        "created_at": datetime.now(timezone.utc),
+    }
+    try:
+        result = collection("services").insert_one(document)
+    except PyMongoError as error:
+        logger.exception("Could not create service")
+        raise HTTPException(status_code=503, detail="Service catalog is unavailable") from error
+
+    document["_id"] = result.inserted_id
+    document.pop("active")
+    document.pop("created_at")
+    document["id"] = str(document.pop("_id"))
+    return document
 
 
 @app.post("/api/requests")

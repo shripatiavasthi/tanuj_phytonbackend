@@ -23,11 +23,35 @@ class InMemoryUsers:
         return self.documents.get(query["email"])
 
 
+class InMemoryAdmins:
+    def __init__(self) -> None:
+        self.document: dict | None = None
+
+    def create_index(self, *_args, **_kwargs) -> None:
+        return None
+
+    def find_one(self, query: dict) -> dict | None:
+        if self.document is None:
+            return None
+        if query.get("_id") == self.document["_id"] or query.get("email") == self.document["email"]:
+            return self.document
+        return None
+
+    def insert_one(self, document: dict) -> SimpleNamespace:
+        if self.document is not None:
+            raise DuplicateKeyError("duplicate admin")
+        self.document = document
+        return SimpleNamespace(inserted_id=document["_id"])
+
+
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     users = InMemoryUsers()
+    admins = InMemoryAdmins()
     monkeypatch.setattr(backend, "users_collection", lambda: users)
+    monkeypatch.setattr(backend, "admins_collection", lambda: admins)
     monkeypatch.setenv("JWT_SECRET", "test-secret-with-sufficient-length")
+    monkeypatch.setenv("CRM_ADMIN_SETUP_SECRET", "test-setup-secret-at-least-32-characters")
     return TestClient(backend.app)
 
 
@@ -118,3 +142,89 @@ def test_registration_rejects_admin_role(client: TestClient) -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_admin_setup_is_one_time_and_requires_setup_secret(client: TestClient) -> None:
+    payload = {
+        "name": "CRM Owner",
+        "email": "OWNER@example.com",
+        "password": "secure-admin-password",
+    }
+
+    unauthorized = client.post("/api/admin/setup", json=payload)
+    created = client.post(
+        "/api/admin/setup",
+        headers={"X-Admin-Setup-Secret": "test-setup-secret-at-least-32-characters"},
+        json=payload,
+    )
+    second_setup = client.post(
+        "/api/admin/setup",
+        headers={"X-Admin-Setup-Secret": "test-setup-secret-at-least-32-characters"},
+        json=payload,
+    )
+
+    assert unauthorized.status_code == 401
+    assert created.status_code == 201
+    assert created.json()["admin"] == {
+        "id": "primary",
+        "name": "CRM Owner",
+        "email": "owner@example.com",
+    }
+    assert "password_hash" not in created.json()["admin"]
+    assert second_setup.status_code == 409
+
+
+def test_admin_login_and_admin_only_user_creation(client: TestClient) -> None:
+    client.post(
+        "/api/admin/setup",
+        headers={"X-Admin-Setup-Secret": "test-setup-secret-at-least-32-characters"},
+        json={
+            "name": "CRM Owner",
+            "email": "owner@example.com",
+            "password": "secure-admin-password",
+        },
+    )
+    login = client.post(
+        "/api/admin/login",
+        json={"email": "OWNER@example.com", "password": "secure-admin-password"},
+    )
+    invalid_login = client.post(
+        "/api/admin/login",
+        json={"email": "owner@example.com", "password": "incorrect-password"},
+    )
+    headers = {"Authorization": f"Bearer {login.json()['token']}"}
+    created_user = client.post(
+        "/api/admin/users",
+        headers=headers,
+        json={
+            "name": "Managed Consumer",
+            "email": "managed@example.com",
+            "password": "secure-user-password",
+            "role": "consumer",
+        },
+    )
+
+    assert login.status_code == 200
+    assert login.json()["admin"]["email"] == "owner@example.com"
+    assert invalid_login.status_code == 401
+    assert created_user.status_code == 200
+    assert created_user.json()["user"]["email"] == "managed@example.com"
+    assert "token" not in created_user.json()
+
+
+def test_admin_only_service_creation_rejects_non_admin_token(client: TestClient) -> None:
+    consumer = client.post(
+        "/api/auth/register",
+        json={
+            "name": "Regular User",
+            "email": "regular@example.com",
+            "password": "secure-user-password",
+        },
+    )
+    response = client.post(
+        "/api/services",
+        headers={"Authorization": f"Bearer {consumer.json()['token']}"},
+        json={"name": "Nursing Care"},
+    )
+
+    assert response.status_code == 403
